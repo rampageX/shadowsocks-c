@@ -13,3 +13,9 @@ static musl. Windows executables import only Windows system DLLs.
 The build uses upstream's bundled dependency mode, including libsodium and
 the reduced Mbed TLS configuration. Both libraries are required by the
 current implementation.
+
+If GitHub returns HTTP 403 when creating a release, add a repository Actions
+secret named `RELEASE_TOKEN` with a token authorized for this repository and
+`Contents: Read and write`. Run the workflow again. With no secret, the
+workflow uses the default Actions token. The four tested archives are also
+available from the Artifacts section of each completed build run.
