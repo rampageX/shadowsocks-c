@@ -1,0 +1,218 @@
+name: Static release
+
+on:
+  push:
+    branches: [master]
+    paths: [.github/workflows/static-release.yml]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag. Leave blank to use the source version and commit.'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: static-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve release tag
+        id: tag
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$REQUESTED_TAG
+          if [[ -z $tag ]]; then
+            version=$(sed -nE 's/^set\(PROJECT_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"\)$/\1/p' CMakeLists.txt)
+            tag="v${version}-rampage.${GITHUB_SHA:0:12}"
+          fi
+          if [[ ! $tag =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)*$ ]]; then
+            echo "::error::Invalid release tag: $tag"
+            exit 1
+          fi
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+            --jq ".[] | select(.ref == \"refs/tags/$tag\") | .ref")
+          if [[ -n $existing ]]; then
+            echo "::error::Tag already exists: $tag. Choose a new release tag."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  linux:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, machine: 'Advanced Micro Devices X86-64' }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, machine: AArch64 }
+    runs-on: ${{ matrix.runner }}
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      ARCH: ${{ matrix.arch }}
+      MACHINE: ${{ matrix.machine }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and test fully static Alpine/musl programs
+        run: docker build -f docker/static/Dockerfile --target artifacts --output type=local,dest=stage .
+      - name: Verify architecture and package
+        run: |
+          test -x stage/bin/ss-server
+          for program in stage/bin/ss-*; do
+            header=$(LC_ALL=C readelf -h "$program")
+            [[ $header == *"Machine:"*"$MACHINE"* ]]
+          done
+          cp COPYING LICENSE stage/
+          mkdir dist
+          tar -C stage -czf "dist/shadowsocks-c-$TAG-linux-$ARCH.tar.gz" bin share/licenses COPYING LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  armv5te:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install ARM soft-float musl toolchain and emulator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build qemu-user
+          cd "$RUNNER_TEMP"
+          toolchain=armv5-eabi--musl--stable-2024.05-1
+          curl -fLsS --retry 3 "https://toolchains.bootlin.com/downloads/releases/toolchains/armv5-eabi/tarballs/$toolchain.tar.xz" -o "$toolchain.tar.xz"
+          echo "9825d9a4515a92d2251aab3228ddbb6258440b0f952b95fcaa94653a4b29c71a  $toolchain.tar.xz" | sha256sum -c -
+          tar -xf "$toolchain.tar.xz"
+          echo "CROSS=$RUNNER_TEMP/$toolchain/bin/arm-buildroot-linux-musleabi" >> "$GITHUB_ENV"
+      - name: Build, verify and test ARMv5TE programs
+        run: |
+          cmake -S . -B build-arm -G Ninja \
+            -DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=armv5te \
+            -DCMAKE_C_COMPILER="$CROSS-gcc" -DCMAKE_CXX_COMPILER="$CROSS-g++" \
+            -DCMAKE_C_FLAGS="-march=armv5te -marm -mfloat-abi=soft" \
+            -DCMAKE_CXX_FLAGS="-march=armv5te -marm -mfloat-abi=soft" \
+            -DCMAKE_EXE_LINKER_FLAGS=-static -DCMAKE_CXX_STANDARD_LIBRARIES=-latomic \
+            -DSS_DEPENDENCY_MODE=bundled -DWITH_STATIC=ON -DBUILD_TESTING=OFF \
+            -DSS_BUILD_STATIC_LIBRARY=OFF -DSS_BUILD_SHARED_LIBRARY=OFF
+          cmake --build build-arm --parallel 4
+          cmake --install build-arm --prefix "$PWD/stage" --strip
+          test -x stage/bin/ss-server
+          mkdir qemu-bin
+          for program in "$PWD"/stage/bin/ss-*; do
+            header=$(LC_ALL=C readelf -h "$program")
+            [[ $header == *"Machine:"*ARM* && $header == *"soft-float ABI"* ]]
+            LC_ALL=C readelf -A "$program" | grep -E 'Tag_CPU_arch: v5TEJ?$'
+            headers=$(LC_ALL=C readelf -l "$program")
+            dynamic=$(LC_ALL=C readelf -d "$program")
+            [[ $headers != *INTERP* && $dynamic != *NEEDED* ]]
+            printf '#!/bin/bash\nexec qemu-arm -cpu arm926 %q "$@"\n' "$program" > "qemu-bin/${program##*/}"
+            chmod +x "qemu-bin/${program##*/}"
+          done
+          python3 tests/interop.py --self --bin qemu-bin
+          python3 tests/async_dns_interop.py --bin qemu-bin
+          cp COPYING LICENSE stage/
+          mkdir dist
+          tar -C stage -czf "dist/shadowsocks-c-$TAG-linux-armv5te-sf.tar.gz" bin share/licenses COPYING LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-armv5te-sf
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            zip
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-python
+      - name: Build and test static Windows x64 programs
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-static -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DSS_DEPENDENCY_MODE=bundled -DWITH_STATIC=ON \
+            -DSS_BUILD_STATIC_LIBRARY=OFF -DSS_BUILD_SHARED_LIBRARY=OFF
+          cmake --build build-static --parallel 4
+          ctest --test-dir build-static -L 'unit|vendor' --output-on-failure --no-tests=error
+          cmake --install build-static --prefix "$PWD/stage" --strip
+          test -f stage/bin/ss-server.exe
+          for program in stage/bin/ss-*.exe; do
+            header=$(llvm-readobj --file-headers "$program")
+            [[ $header == *IMAGE_FILE_MACHINE_AMD64* ]]
+          done
+          python tests/check_static_runtime.py stage/bin/ss-*.exe
+          python tests/interop.py --self --bin stage/bin --isolate-windows-runtime
+          python tests/async_dns_interop.py --bin stage/bin --isolate-windows-runtime
+          cp COPYING LICENSE stage/
+          mkdir dist
+          cd stage
+          zip -qr "../dist/shadowsocks-c-$TAG-windows-x64.zip" bin share/licenses COPYING LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, linux, armv5te, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish four static archives
+        run: |
+          assets=(
+            "dist/shadowsocks-c-$TAG-linux-armv5te-sf.tar.gz"
+            "dist/shadowsocks-c-$TAG-linux-aarch64.tar.gz"
+            "dist/shadowsocks-c-$TAG-linux-x86_64.tar.gz"
+            "dist/shadowsocks-c-$TAG-windows-x64.zip"
+          )
+          for asset in "${assets[@]}"; do test -s "$asset"; done
+          cat > release-notes.md <<NOTES
+          Static command-line builds from commit $GITHUB_SHA.
+
+          | Platform | Architecture | Archive |
+          | --- | --- | --- |
+          | Linux | ARMv5TE soft-float, AArch64, x86_64 | .tar.gz |
+          | Windows | x64 | .zip |
+
+          Linux links musl statically. Windows requires only system DLLs.
+          Crypto uses bundled libsodium and the project's reduced Mbed TLS configuration.
+          NOTES
+          gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Shadowsocks-C $TAG" --notes-file release-notes.md
