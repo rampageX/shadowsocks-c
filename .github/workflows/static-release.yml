@@ -1,9 +1,6 @@
 name: Static release
 
 on:
-  push:
-    branches: [master]
-    paths: [.github/workflows/static-release.yml]
   workflow_dispatch:
     inputs:
       tag:
